@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp import build_dcp_page_table, dcp_local_cache_seqlens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -30,7 +31,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -51,6 +52,34 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
     return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+
+
+# FA3/FA4 return the softmax LSE in natural log, but every DCP consumer in the
+# tree reduces with exp2: correct_attn_out (behind cp_lse_ag_out_rs_mla) is
+# hard-coded to base 2, and forward_mla calls dcp_a2a_lse_reduce with
+# is_lse_base_on_e=False, both because FlashInfer-MLA and FlashMLA emit base 2.
+# Converting here makes the FA backends look like every other MLA DCP backend,
+# so the model-side reduce needs no per-backend branch.
+_LOG2_E = 1.4426950408889634
+
+
+def _normalize_dcp_lse(softmax_lse: torch.Tensor) -> torch.Tensor:
+    """FA softmax LSE -> ``[num_tokens, num_heads]``, float32, base 2.
+
+    Orientation is keyed on tensor rank rather than on which API produced the
+    value: ``flash_attn_with_kvcache`` returns ``(B, H, S)`` for a 4-D batched
+    query but ``(H, T)`` for the 3-D varlen query that the absorbed-MLA decode
+    path passes, so keying on the call site would silently transpose exactly the
+    path DCP needs. Both forms were measured on H200 against a float32
+    ``logsumexp`` reference.
+    """
+    if softmax_lse.dim() == 3:
+        # (B, H, S), S == 1 on the decode path.
+        softmax_lse = softmax_lse.squeeze(-1)
+    else:
+        # (H, T) varlen form.
+        softmax_lse = softmax_lse.transpose(0, 1)
+    return (softmax_lse.float() * _LOG2_E).contiguous()
 
 
 @dataclass
@@ -115,6 +144,12 @@ class FlashAttentionMetadata:
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+
+    # Set when this metadata was narrowed to the KV slice the local DCP rank
+    # owns: per-rank cache_seqlens, and a page table rebuilt at the widened
+    # stride. Also the signal that the kernel must return the softmax LSE so the
+    # caller can merge the per-rank partial outputs.
+    dcp_local: bool = False
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -192,6 +227,22 @@ class FlashAttentionBackend(AttentionBackend):
         self._unified_dense = self._unified_hooks.enabled and self.use_mla
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
+        # Decode context parallelism: this rank owns the tokens whose global
+        # position satisfies `position % dcp_size == dcp_rank`, so it attends to
+        # a strided subsequence of the KV cache and the per-rank partial outputs
+        # are merged by the caller through an LSE correction. Both collapse to
+        # the non-DCP values (1, 0) when the feature is off, which is what keeps
+        # every DCP branch below a single `if self.dcp_enabled`.
+        # get_parallel(), not model_runner.ps: the latter carries only the
+        # tp/cp subset and has no DCP fields. This is also the accessor the
+        # FlashInfer-MLA DCP path uses.
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_enabled = self.dcp_size > 1
+        assert not (self.dcp_enabled and self._unified_dense), (
+            "DCP and unified memory both rewrite the page table and cannot "
+            "compose; server_args asserts dcp_size == 1 under unified memory."
+        )
         self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -629,6 +680,43 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
+    def _narrow_decode_metadata_to_dcp_rank(
+        self,
+        metadata: FlashAttentionMetadata,
+        seq_lens: torch.Tensor,
+        global_max_seq_len_k: int,
+    ) -> None:
+        """Restrict normal-decode metadata to the KV this DCP rank owns.
+
+        Query is untouched -- under DCP every rank holds the full (all-gathered)
+        query and attends it against its own KV shard, then the partial outputs
+        are merged by an LSE correction on the caller side.
+
+        Must run after ``metadata.page_table`` has been sliced, since that slice
+        needs the GLOBAL width; the table is reduced to physical page ids at the
+        widened stride later, in the shared page-table transform.
+
+        The narrowing is architecture-agnostic, but only absorbed MLA is wired up
+        end to end so far: MLA gets its owner-masked KV writes for free inside
+        ``set_mla_kv_buffer_triton``, whereas MHA/GQA still needs the backend to
+        divide and mask its own writes. Until that lands, the startup guard in
+        ``server_args`` keeps fa3/fa4 off DCP entirely, so no MHA batch can reach
+        this path.
+        """
+        metadata.cache_seqlens_int32 = dcp_local_cache_seqlens(
+            seq_lens, self.dcp_size, self.dcp_rank
+        ).to(torch.int32)
+        # A bound suffices: on the eager path max_seq_len_k only feeds
+        # page-table slicing and the split heuristic, never the kernel.
+        metadata.max_seq_len_k = (
+            global_max_seq_len_k + self.dcp_size - 1
+        ) // self.dcp_size
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+            (1, 0),
+        )
+        metadata.dcp_local = True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -746,6 +834,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                if self.dcp_enabled:
+                    # After the page-table slice, which needs the global width;
+                    # the table itself is reduced at the widened stride below.
+                    self._narrow_decode_metadata_to_dcp_rank(
+                        metadata, seqlens_in_batch, eager_max_k
+                    )
 
                 if self.is_prefill_aware_swa and self.has_swa:
                     pa_max_len = min(
@@ -1064,8 +1158,20 @@ class FlashAttentionBackend(AttentionBackend):
                 .view(pt.shape)
             )
 
+        if metadata.dcp_local:
+            # DCP: virtual token ids -> physical page ids at the WIDENED stride
+            # page_size * dcp_size. This has to run even at page_size == 1, where
+            # the branch below is a no-op, because the virtual -> physical
+            # `// dcp_size` step is still required; hence `dcp_local` and not
+            # `page_size > 1` selects it.
+            assert (
+                not self.use_sliding_window_kv_pool
+            ), "DCP with a sliding-window KV pool is not supported"
+            metadata.page_table = build_dcp_page_table(
+                metadata.page_table, self.page_size, self.dcp_size
+            )
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+        elif self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -1997,6 +2103,19 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
+            # Under DCP this rank attended only the KV it owns, so the caller
+            # (forward_mla) needs the LSE to merge the per-rank partials. Gated
+            # on is_decode() rather than on dcp_local alone so an IDLE batch --
+            # which the model routes through plain attn_mqa, expecting a bare
+            # tensor -- still gets one.
+            dcp_return_lse = (
+                metadata.dcp_local and forward_batch.forward_mode.is_decode()
+            )
+            assert not (dcp_return_lse and use_cascade_attn), (
+                "DCP decode and cascade attention are mutually exclusive; "
+                "cascade requires spec_info, DCP metadata requires its absence."
+            )
+
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
@@ -2012,10 +2131,17 @@ class FlashAttentionBackend(AttentionBackend):
                 softcap=layer.logit_cap,
                 k_descale=fa_k_descale,
                 v_descale=fa_v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                # softmax_lse is needed for merge states
+                return_softmax_lse=use_cascade_attn or dcp_return_lse,
                 num_splits=self.num_splits,
                 ver=self.fa_impl_ver,
             )
+            if dcp_return_lse:
+                o, softmax_lse, *_ = result
+                return (
+                    o.view(-1, layer.tp_q_head_num * layer.v_head_dim),
+                    _normalize_dcp_lse(softmax_lse),
+                )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
