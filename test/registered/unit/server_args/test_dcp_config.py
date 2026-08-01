@@ -98,5 +98,92 @@ class TestDCPCommBackendValidation(CustomTestCase):
         self.assertEqual(args.dcp_size, 8)
 
 
+class TestDCPBackendValidation(CustomTestCase):
+    """Verify ``_handle_dcp_backend_validation`` rejects DCP-unaware backends.
+
+    fa3/fa4 have no DCP implementation, and fa3 is the Hopper default, so without
+    this check a plain ``--dcp-size 8`` on an H100/H200 starts a server whose
+    attention output is silently wrong. The flag-level ``_handle_dcp_validation``
+    cannot catch it because it runs before the backend is auto-selected.
+    """
+
+    @staticmethod
+    def _make_args(dcp_size, attention_backend=None, **kwargs):
+        args = ServerArgs(model_path="dummy")
+        args.dcp_size = dcp_size
+        if attention_backend is not None:
+            args.attention_backend = attention_backend
+        for key, value in kwargs.items():
+            setattr(args, key, value)
+        return args
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_fa3_with_dcp_raises(self, *_):
+        args = self._make_args(dcp_size=8, attention_backend="fa3")
+        with self.assertRaises(ValueError) as ctx:
+            args._handle_dcp_backend_validation()
+        self.assertIn("fa3", str(ctx.exception))
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_fa4_with_dcp_raises(self, *_):
+        args = self._make_args(dcp_size=4, attention_backend="fa4")
+        with self.assertRaises(ValueError):
+            args._handle_dcp_backend_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_fa3_without_dcp_passes(self, *_):
+        # The guard must be inert when DCP is off -- fa3 is the Hopper default
+        # for the overwhelming majority of runs.
+        args = self._make_args(dcp_size=1, attention_backend="fa3")
+        args._handle_dcp_backend_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_dcp_capable_backends_pass(self, *_):
+        for backend in ("triton", "flashinfer", "trtllm_mla", "tokenspeed_mla"):
+            with self.subTest(backend=backend):
+                args = self._make_args(dcp_size=8, attention_backend=backend)
+                args._handle_dcp_backend_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hip_is_exempt(self, *_):
+        # HIP is the originally validated DCP platform and routes through its own
+        # backends; the fa3/fa4 denylist is a CUDA concern.
+        args = self._make_args(dcp_size=8, attention_backend="fa3")
+        args._handle_dcp_backend_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_dcp_unaware_prefill_backend_raises(self, *_):
+        # DCP owner-masks KV writes, which happen on the extend path, so a
+        # DCP-unaware prefill backend corrupts the cache even when decode is fine.
+        args = self._make_args(
+            dcp_size=8,
+            attention_backend="triton",
+            prefill_attention_backend="fa3",
+            decode_attention_backend="triton",
+        )
+        with self.assertRaises(ValueError):
+            args._handle_dcp_backend_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_dcp_unaware_decode_backend_raises(self, *_):
+        args = self._make_args(
+            dcp_size=8,
+            attention_backend="triton",
+            prefill_attention_backend="triton",
+            decode_attention_backend="fa3",
+        )
+        with self.assertRaises(ValueError):
+            args._handle_dcp_backend_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_error_message_mentions_hopper_default_and_alternatives(self, *_):
+        args = self._make_args(dcp_size=8, attention_backend="fa3")
+        with self.assertRaises(ValueError) as ctx:
+            args._handle_dcp_backend_validation()
+        message = str(ctx.exception)
+        self.assertIn("Hopper", message)
+        self.assertIn("triton", message)
+
+
 if __name__ == "__main__":
     unittest.main()

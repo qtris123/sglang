@@ -227,6 +227,13 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
 
+# Attention backends that have no decode-context-parallel implementation: they
+# neither owner-mask their KV writes nor return the per-rank softmax LSE that the
+# DCP reduction needs, so running them under --dcp-size > 1 corrupts results
+# rather than failing. Kept as a denylist rather than an allowlist so it can only
+# reject configurations that are already broken; see _handle_dcp_backend_validation.
+DCP_UNSUPPORTED_ATTENTION_BACKENDS = ["fa3", "fa4"]
+
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
@@ -3480,6 +3487,10 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        # Backend-dependent half of DCP validation. Must stay after
+        # _handle_attention_backend_compatibility() so the Hopper fa3 default is
+        # visible; the flag-only half runs earlier in _handle_dcp_validation().
+        self._handle_dcp_backend_validation()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
@@ -3821,6 +3832,49 @@ class ServerArgs:
                 "--decode-context-parallel-size > 1) is currently only "
                 f"supported on the AMD HIP platform, but got dcp_size="
                 f"{self.dcp_size} on a non-HIP platform."
+            )
+
+    def _handle_dcp_backend_validation(self):
+        """Reject attention backends that have no DCP implementation.
+
+        This is the backend-dependent half of DCP validation; the flag-level half
+        runs earlier in ``_handle_dcp_validation``. It must run after
+        ``_handle_attention_backend_compatibility()`` because the backend is only
+        auto-selected there: on Hopper an unset ``--attention-backend`` resolves to
+        fa3 (unconditionally for MLA, and for MHA when speculative decoding is off
+        or topk == 1), so checking any earlier would see None and let the default
+        through.
+
+        Both the prefill and decode backends are checked. DCP owner-masks the KV
+        cache writes, which happen on the extend/prefill path, so a DCP-unaware
+        prefill backend corrupts the cache even when decode is DCP-aware.
+        """
+        if not self.dcp_size > 1:
+            return
+        if is_hip():
+            return
+
+        assert resolved_view(self).attention_backend is not None, (
+            "_handle_dcp_backend_validation must run after "
+            "_handle_attention_backend_compatibility() so the backends are resolved."
+        )
+
+        backends = set(self._resolved_attention_backends())
+        backends.discard(None)
+        unsupported = backends.intersection(DCP_UNSUPPORTED_ATTENTION_BACKENDS)
+        if unsupported:
+            raise ValueError(
+                "Decode context parallel (--dcp-size / "
+                f"--decode-context-parallel-size = {self.dcp_size} > 1) is not "
+                f"supported by attention backend(s) {sorted(unsupported)}. "
+                "FlashAttention (fa3/fa4) has no DCP implementation: it does not "
+                "owner-mask its KV cache writes and does not return the per-rank "
+                "softmax LSE required to combine partial attention outputs across "
+                "ranks, so it would produce silently incorrect results rather than "
+                "fail. Note that fa3 is the default attention backend on Hopper, so "
+                "this can trigger without --attention-backend being passed at all; "
+                "select a DCP-capable backend explicitly (triton, flashinfer, "
+                "trtllm_mla, cutedsl_mla, tokenspeed_mla, or flashmla)."
             )
 
     def _handle_load_balance_method(self):
